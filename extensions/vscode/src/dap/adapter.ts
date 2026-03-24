@@ -299,6 +299,36 @@ export class SorobanDebugSession extends DebugSession {
     this.sendResponse(response);
   }
 
+  protected async evaluateRequest(
+    response: DebugProtocol.EvaluateResponse,
+    args: DebugProtocol.EvaluateArguments
+  ): Promise<void> {
+    if (!this.debuggerProcess || !this.state.isPaused) {
+      this.sendErrorResponse(response, {
+        id: 1004,
+        format: 'Evaluation is only available when the debugger is paused',
+        showUser: true
+      });
+      return;
+    }
+
+    try {
+      const result = await this.debuggerProcess.evaluate(args.expression, args.frameId);
+      response.body = {
+        result: result.result,
+        type: result.type,
+        variablesReference: result.variablesReference
+      };
+      this.sendResponse(response);
+    } catch (error) {
+      this.sendErrorResponse(response, {
+        id: 1005,
+        format: `${error}`,
+        showUser: false
+      });
+    }
+  }
+
   protected async disconnectRequest(
     response: DebugProtocol.DisconnectResponse,
     args: DebugProtocol.DisconnectArguments

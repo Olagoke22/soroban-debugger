@@ -497,6 +497,74 @@ impl DebugServer {
                         },
                     }
                 }
+                DebugRequest::Evaluate { expression, .. } => match self.engine.as_ref() {
+                    Some(engine) => {
+                        // First try to look up the expression as a storage key
+                        match engine.executor().get_storage_snapshot() {
+                            Ok(snapshot) => {
+                                if let Some(value) = snapshot.get(&expression) {
+                                    let result = serde_json::to_string(value)
+                                        .unwrap_or_else(|_| format!("{:?}", value));
+                                    DebugResponse::EvaluateResult {
+                                        result,
+                                        result_type: Some("storage".to_string()),
+                                        variables_reference: 0,
+                                    }
+                                } else {
+                                    // Try matching built-in state fields
+                                    let state_result =
+                                        engine.state().lock().ok().and_then(|state| {
+                                            match expression.as_str() {
+                                                "function" | "current_function" => {
+                                                    state.current_function().map(|f| {
+                                                        (f.to_string(), "string".to_string())
+                                                    })
+                                                }
+                                                "args" | "arguments" => {
+                                                    state.current_args().map(|a| {
+                                                        (a.to_string(), "string".to_string())
+                                                    })
+                                                }
+                                                "step_count" | "steps" => Some((
+                                                    state.step_count().to_string(),
+                                                    "number".to_string(),
+                                                )),
+                                                _ => None,
+                                            }
+                                        });
+
+                                    match state_result {
+                                        Some((result, result_type)) => {
+                                            DebugResponse::EvaluateResult {
+                                                result,
+                                                result_type: Some(result_type),
+                                                variables_reference: 0,
+                                            }
+                                        }
+                                        None => DebugResponse::Error {
+                                            message: format!(
+                                                "Cannot evaluate '{}': only storage key lookup \
+                                                 and built-in fields (function, args, \
+                                                 step_count) are supported",
+                                                expression
+                                            ),
+                                        },
+                                    }
+                                }
+                            }
+                            Err(e) => DebugResponse::Error {
+                                message: format!(
+                                    "Failed to access storage for evaluation: {}",
+                                    e
+                                ),
+                            },
+                        }
+                    }
+                    None => DebugResponse::Error {
+                        message: "No contract loaded. Evaluation requires an active debug session."
+                            .to_string(),
+                    },
+                },
                 DebugRequest::Ping => DebugResponse::Pong,
                 DebugRequest::Disconnect => DebugResponse::Disconnected,
             };

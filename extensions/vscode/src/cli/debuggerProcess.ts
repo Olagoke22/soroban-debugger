@@ -46,6 +46,7 @@ type DebugRequest =
   | { type: 'GetStorage' }
   | { type: 'SetBreakpoint'; function: string }
   | { type: 'ClearBreakpoint'; function: string }
+  | { type: 'Evaluate'; expression: string; frame_id?: number }
   | { type: 'Ping' }
   | { type: 'Disconnect' }
   | { type: 'LoadSnapshot'; snapshot_path: string };
@@ -61,6 +62,7 @@ type DebugResponse =
   | { type: 'SnapshotLoaded'; summary: string }
   | { type: 'BreakpointSet'; function: string }
   | { type: 'BreakpointCleared'; function: string }
+  | { type: 'EvaluateResult'; result: string; result_type?: string; variables_reference: number }
   | { type: 'Pong' }
   | { type: 'Disconnected' }
   | { type: 'Error'; message: string };
@@ -235,6 +237,20 @@ export class DebuggerProcess {
       function: functionName
     });
     this.expectResponse(response, 'BreakpointCleared');
+  }
+
+  async evaluate(expression: string, frameId?: number): Promise<{ result: string; type?: string; variablesReference: number }> {
+    const response = await this.sendRequest({
+      type: 'Evaluate',
+      expression,
+      frame_id: frameId
+    });
+    this.expectResponse(response, 'EvaluateResult');
+    return {
+      result: response.result,
+      type: response.result_type,
+      variablesReference: response.variables_reference
+    };
   }
 
   async getContractFunctions(): Promise<Set<string>> {

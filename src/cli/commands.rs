@@ -1733,6 +1733,7 @@ pub fn analyze(args: AnalyzeArgs, _verbosity: Verbosity) -> Result<()> {
     if let Some(function) = &args.function {
         let mut dynamic_executor = ContractExecutor::new(wasm_file.bytes.clone())?;
         dynamic_executor.enable_mock_all_auths();
+        dynamic_executor.set_timeout(args.timeout);
 
         if let Some(storage_json) = &args.storage {
             dynamic_executor.set_initial_storage(parse_storage(storage_json)?)?;
@@ -1746,12 +1747,7 @@ pub fn analyze(args: AnalyzeArgs, _verbosity: Verbosity) -> Result<()> {
 
         match dynamic_executor.execute(function, parsed_args.as_deref()) {
             Ok(result) => {
-                let trace: Vec<String> = dynamic_executor
-                    .get_diagnostic_events()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|event| format!("{:?}", event))
-                    .collect();
+                let trace = dynamic_executor.get_dynamic_trace().unwrap_or_default();
 
                 dynamic_analysis = Some(DynamicAnalysisMetadata {
                     function: function.clone(),
