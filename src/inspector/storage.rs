@@ -2,6 +2,8 @@ use crate::{DebuggerError, Result};
 use crossterm::style::{Color, Stylize};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use soroban_env_host::budget::AsBudget;
+use soroban_env_host::xdr::{LedgerEntryData, LedgerKey};
 use soroban_env_host::Host;
 use std::collections::HashMap;
 use std::fs;
@@ -146,6 +148,15 @@ impl StorageInspector {
     pub fn new() -> Self {
         Self {
             storage: HashMap::new(),
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+        }
+    }
+
+    /// Create a StorageInspector from an existing storage snapshot
+    pub fn with_state(storage: HashMap<String, String>) -> Self {
+        Self {
+            storage,
             reads: HashMap::new(),
             writes: HashMap::new(),
         }
@@ -349,19 +360,58 @@ impl StorageInspector {
         crate::logging::log_display("", crate::logging::LogLevel::Info);
     }
 
+    /// Sync access tracking from DebugEnv
+    pub fn sync_from_debug_env(&mut self, debug_env: &crate::runtime::env::DebugEnv) {
+        for access in debug_env.storage_accesses() {
+            match &access.access_type {
+                crate::runtime::env::StorageAccessType::Read => {
+                    self.track_read(&access.key);
+                }
+                crate::runtime::env::StorageAccessType::Write => {
+                    self.track_write(&access.key);
+                }
+            }
+        }
+    }
+
     /// Capture a snapshot of all storage entries from the host
-    pub fn capture_snapshot(_host: &Host) -> HashMap<String, String> {
-        // In a real implementation, we would iterate through host.get_ledger_entries()
-        // or track changes via a custom Storage instance.
-        // For this debugger, we'll try to extract what's available.
-        // Since Host doesn't easily expose all entries without XDR iteration,
-        // we'll use a placeholder logic that would be backed by actual storage tracking
-        // in a production environment.
+    pub fn capture_snapshot(host: &Host) -> HashMap<String, String> {
+        match host.with_mut_storage(|storage| {
+            let mut snapshot = HashMap::new();
 
-        // NOTE: In Soroban host, entries are typically accessed by key.
-        // To show "everything", we'd need to have tracked access during execution.
+            for (key, entry_opt) in storage.map.iter(host.as_budget())? {
+                let Some((entry, ttl)) = entry_opt.as_ref() else {
+                    continue;
+                };
 
-        HashMap::new()
+                let key_str = match key.as_ref() {
+                    LedgerKey::ContractData(cd) => {
+                        format!("contract_data:{:?}:{:?}", cd.durability, cd.key)
+                    }
+                    LedgerKey::ContractCode(_) => "contract_code".to_string(),
+                    other => format!("{:?}", other),
+                };
+
+                let mut value_str = match &entry.as_ref().data {
+                    LedgerEntryData::ContractData(cd) => format!("{:?}", cd.val),
+                    other => format!("{:?}", other),
+                };
+
+                if let Some(live_until) = ttl {
+                    value_str.push_str(&format!(" (ttl={})", live_until));
+                }
+
+                snapshot.insert(key_str, value_str);
+            }
+
+            Ok(snapshot)
+        }) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!("Failed to capture storage snapshot: {}", e);
+                HashMap::new()
+            }
+        }
     }
 
     /// Compute the difference between two storage snapshots
@@ -385,14 +435,14 @@ impl StorageInspector {
                 Some(val_before) => {
                     if val_before != val_after {
                         modified.insert(key.clone(), (val_before.clone(), val_after.clone()));
-                        if alert_filter.matches(key) {
+                        if !alerts.is_empty() && alert_filter.matches(key) {
                             triggered_alerts.push(key.clone());
                         }
                     }
                 }
                 None => {
                     added.insert(key.clone(), val_after.clone());
-                    if alert_filter.matches(key) {
+                    if !alerts.is_empty() && alert_filter.matches(key) {
                         triggered_alerts.push(key.clone());
                     }
                 }
@@ -402,7 +452,7 @@ impl StorageInspector {
         for key in before.keys() {
             if !after.contains_key(key) {
                 deleted.push(key.clone());
-                if alert_filter.matches(key) {
+                if !alerts.is_empty() && alert_filter.matches(key) {
                     triggered_alerts.push(key.clone());
                 }
             }
@@ -486,7 +536,7 @@ impl StorageInspector {
 }
 
 /// Represents the differences between two storage states
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StorageDiff {
     pub added: HashMap<String, String>,
     pub modified: HashMap<String, (String, String)>,
@@ -840,5 +890,93 @@ mod tests {
         inspector.track_read("user:bob:balance");
 
         inspector.display_access_report();
+    }
+
+    #[test]
+    fn test_storage_diff_empty_before_empty_after() {
+        let before: HashMap<String, String> = HashMap::new();
+        let after: HashMap<String, String> = HashMap::new();
+        let diff = StorageInspector::compute_diff(&before, &after, &[]);
+        assert!(diff.is_empty());
+        assert!(diff.added.is_empty());
+        assert!(diff.modified.is_empty());
+        assert!(diff.deleted.is_empty());
+        assert!(diff.triggered_alerts.is_empty());
+    }
+
+    #[test]
+    fn test_storage_diff_large_mixed_changes() {
+        let mut before = HashMap::new();
+        let mut after = HashMap::new();
+
+        // 1-50: unchanged
+        for i in 1..=50 {
+            let k = format!("key_{}", i);
+            let v = format!("val_{}", i);
+            before.insert(k.clone(), v.clone());
+            after.insert(k, v);
+        }
+
+        // 51-75: modified
+        for i in 51..=75 {
+            before.insert(format!("key_{}", i), "old".to_string());
+            after.insert(format!("key_{}", i), "new".to_string());
+        }
+
+        // 76-100: deleted
+        for i in 76..=100 {
+            before.insert(format!("key_{}", i), "gone".to_string());
+        }
+
+        // 101-125: added
+        for i in 101..=125 {
+            after.insert(format!("key_{}", i), "fresh".to_string());
+        }
+
+        let diff = StorageInspector::compute_diff(&before, &after, &[]);
+        assert_eq!(diff.added.len(), 25);
+        assert_eq!(diff.modified.len(), 25);
+        assert_eq!(diff.deleted.len(), 25);
+
+        // Verify a specific one of each
+        assert_eq!(diff.added.get("key_101").unwrap(), "fresh");
+        assert_eq!(
+            diff.modified.get("key_51").unwrap(),
+            &("old".to_string(), "new".to_string())
+        );
+        assert!(diff.deleted.contains(&"key_76".to_string()));
+    }
+
+    #[test]
+    fn test_storage_diff_binary_non_utf8_values() {
+        let mut before = HashMap::new();
+        let mut after = HashMap::new();
+
+        // Use strings that contain potentially problematic byte sequences
+        // Note: Rust String is UTF-8, but we can store raw bytes as escaped characters
+        // or just use arbitrary valid UTF-8 that looks like binary (e.g. including nulls or high-bit chars)
+        let binary_val1 = "val\x00\u{FFFF}\u{FFFE}".to_string();
+        let binary_val2 = "val\x01\x02\x03".to_string();
+        let emoji_key = "🔑".to_string();
+
+        before.insert(emoji_key.clone(), binary_val1.clone());
+        after.insert(emoji_key.clone(), binary_val2.clone());
+
+        let binary_key_added = "key\x00bin".to_string();
+        after.insert(binary_key_added.clone(), "some_val".to_string());
+
+        let diff = StorageInspector::compute_diff(&before, &after, &[]);
+
+        assert_eq!(
+            diff.added.get(&binary_key_added).unwrap(),
+            &"some_val".to_string()
+        );
+        assert_eq!(
+            diff.modified.get(&emoji_key).unwrap(),
+            &(binary_val1, binary_val2)
+        );
+
+        // Ensure display_diff doesn't panic with these values
+        StorageInspector::display_diff(&diff);
     }
 }

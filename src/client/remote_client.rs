@@ -5,8 +5,9 @@ use std::net::TcpStream;
 use tracing::info;
 
 /// Remote client for connecting to a debug server
+#[derive(Debug)]
 pub struct RemoteClient {
-    stream: TcpStream,
+    stream: BufReader<TcpStream>,
     message_id: u64,
     authenticated: bool,
 }
@@ -16,11 +17,11 @@ impl RemoteClient {
     pub fn connect(addr: &str, token: Option<String>) -> Result<Self> {
         info!("Connecting to debug server at {}", addr);
         let stream = TcpStream::connect(addr).map_err(|e| {
-            DebuggerError::FileError(format!("Failed to connect to {}: {}", addr, e))
+            DebuggerError::NetworkError(format!("Failed to connect to {}: {}", addr, e))
         })?;
 
         let mut client = Self {
-            stream,
+            stream: BufReader::new(stream),
             message_id: 0,
             authenticated: token.is_none(),
         };
@@ -91,6 +92,7 @@ impl RemoteClient {
                 success,
                 output,
                 error,
+                ..
             } => {
                 if success {
                     Ok(output)
@@ -108,20 +110,57 @@ impl RemoteClient {
         }
     }
 
-    /// Step execution
-    pub fn step(&mut self) -> Result<(bool, Option<String>, u64)> {
-        let response = self.send_request(DebugRequest::Step)?;
+    /// Step into next inline/instruction
+    pub fn step_in(&mut self) -> Result<(bool, Option<String>, u64)> {
+        let response = self.send_request(DebugRequest::StepIn)?;
 
         match response {
             DebugResponse::StepResult {
                 paused,
                 current_function,
                 step_count,
+                ..
+            } => Ok((paused, current_function, step_count)),
+            DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
+            _ => Err(
+                DebuggerError::ExecutionError("Unexpected response to StepIn".to_string()).into(),
+            ),
+        }
+    }
+
+    /// Step over current function
+    pub fn step_over(&mut self) -> Result<(bool, Option<String>, u64)> {
+        let response = self.send_request(DebugRequest::Next)?;
+
+        match response {
+            DebugResponse::StepResult {
+                paused,
+                current_function,
+                step_count,
+                ..
             } => Ok((paused, current_function, step_count)),
             DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
             _ => {
-                Err(DebuggerError::ExecutionError("Unexpected response to Step".to_string()).into())
+                Err(DebuggerError::ExecutionError("Unexpected response to Next".to_string()).into())
             }
+        }
+    }
+
+    /// Step out of current function
+    pub fn step_out(&mut self) -> Result<(bool, Option<String>, u64)> {
+        let response = self.send_request(DebugRequest::StepOut)?;
+
+        match response {
+            DebugResponse::StepResult {
+                paused,
+                current_function,
+                step_count,
+                ..
+            } => Ok((paused, current_function, step_count)),
+            DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
+            _ => Err(
+                DebuggerError::ExecutionError("Unexpected response to StepOut".to_string()).into(),
+            ),
         }
     }
 
@@ -148,6 +187,7 @@ impl RemoteClient {
                 step_count,
                 paused,
                 call_stack,
+                ..
             } => Ok((function, step_count, paused, call_stack)),
             DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
             _ => Err(
@@ -327,37 +367,82 @@ impl RemoteClient {
         }
 
         self.message_id += 1;
-        let message = DebugMessage::request(self.message_id, request);
+        let expected_id = self.message_id;
+        let message = DebugMessage::request(expected_id, request);
 
         let request_json = serde_json::to_string(&message)
             .map_err(|e| DebuggerError::FileError(format!("Failed to serialize request: {}", e)))?;
 
         // Send request
-        writeln!(self.stream, "{}", request_json)
-            .map_err(|e| DebuggerError::FileError(format!("Failed to write to stream: {}", e)))?;
+        writeln!(self.stream.get_mut(), "{}", request_json).map_err(|e| {
+            DebuggerError::NetworkError(format!("Failed to write to stream: {}", e))
+        })?;
         self.stream
+            .get_mut()
             .flush()
-            .map_err(|e| DebuggerError::FileError(format!("Failed to flush stream: {}", e)))?;
+            .map_err(|e| DebuggerError::NetworkError(format!("Failed to flush stream: {}", e)))?;
 
         // Read response
-        let reader = BufReader::new(&self.stream);
-        let mut lines = reader.lines();
-        let response_line = lines
-            .next()
-            .ok_or_else(|| DebuggerError::FileError("No response from server".to_string()))?
-            .map_err(|e| DebuggerError::FileError(format!("Failed to read response: {}", e)))?;
+        let mut response_line = String::new();
+        let n = self
+            .stream
+            .read_line(&mut response_line)
+            .map_err(|e| DebuggerError::NetworkError(format!("Failed to read response: {}", e)))?;
+        if n == 0 {
+            return Err(DebuggerError::NetworkError("No response from server".to_string()).into());
+        }
 
-        let response_message: DebugMessage = serde_json::from_str(&response_line)
-            .map_err(|e| DebuggerError::FileError(format!("Failed to parse response: {}", e)))?;
-
-        response_message.response.ok_or_else(|| {
-            DebuggerError::FileError("Response message has no response field".to_string()).into()
-        })
+        parse_response_line(expected_id, response_line.trim_end())
     }
+}
+
+fn parse_response_line(expected_id: u64, response_line: &str) -> Result<DebugResponse> {
+    let response_message: DebugMessage = serde_json::from_str(response_line)
+        .map_err(|e| DebuggerError::FileError(format!("Failed to parse response: {}", e)))?;
+
+    if response_message.id != expected_id {
+        return Err(DebuggerError::ExecutionError(format!(
+            "Mismatched response id: expected {} got {}",
+            expected_id, response_message.id
+        ))
+        .into());
+    }
+
+    response_message.response.ok_or_else(|| {
+        DebuggerError::FileError("Response message has no response field".to_string()).into()
+    })
 }
 
 impl Drop for RemoteClient {
     fn drop(&mut self) {
         let _ = self.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::protocol::DebugResponse;
+
+    #[test]
+    fn parse_response_line_rejects_mismatched_ids() {
+        let msg = DebugMessage::response(42, DebugResponse::Pong);
+        let line = serde_json::to_string(&msg).unwrap();
+        let err = parse_response_line(7, &line).unwrap_err();
+        assert!(err.to_string().contains("Mismatched response id"));
+    }
+
+    #[test]
+    fn parse_response_line_accepts_matching_ids() {
+        let msg = DebugMessage::response(7, DebugResponse::Pong);
+        let line = serde_json::to_string(&msg).unwrap();
+        let resp = parse_response_line(7, &line).unwrap();
+        assert!(matches!(resp, DebugResponse::Pong));
+    }
+
+    #[test]
+    fn connect_failure_is_network_error_category() {
+        let err = RemoteClient::connect("127.0.0.1:1", None).unwrap_err();
+        assert!(err.to_string().contains("Network/transport error"));
     }
 }

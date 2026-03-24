@@ -33,77 +33,67 @@ fn initialize_tracing(verbosity: Verbosity) {
     }
 }
 
+fn print_deprecation_warning(deprecated_flag: &str, new_flag: &str) {
+    eprintln!(
+        "{}",
+        Formatter::warning(format!(
+            " Flag '{}' is deprecated. Please use '{}' instead.",
+            deprecated_flag, new_flag
+        ))
+    );
+}
+
 fn handle_deprecations(cli: &mut Cli) {
     match &mut cli.command {
         Some(Commands::Run(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                tracing::warn!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
-                args.contract = wasm;
+                print_deprecation_warning("--wasm", "--contract");
+                args.contract = Some(wasm);
             }
             if let Some(snapshot) = args.snapshot.take() {
-                tracing::warn!(
-                    "{}",
-                    Formatter::warning(
-                        "Warning: --snapshot is deprecated. Please use --network-snapshot instead."
-                    )
-                );
+                print_deprecation_warning("--snapshot", "--network-snapshot");
                 args.network_snapshot = Some(snapshot);
             }
         }
         Some(Commands::Interactive(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                tracing::warn!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
             if let Some(snapshot) = args.snapshot.take() {
-                tracing::warn!(
-                    "{}",
-                    Formatter::warning(
-                        "Warning: --snapshot is deprecated. Please use --network-snapshot instead."
-                    )
-                );
+                print_deprecation_warning("--snapshot", "--network-snapshot");
                 args.network_snapshot = Some(snapshot);
             }
         }
         Some(Commands::Inspect(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                tracing::warn!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
         }
         Some(Commands::Optimize(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                tracing::warn!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
             if let Some(snapshot) = args.snapshot.take() {
-                tracing::warn!(
-                    "{}",
-                    Formatter::warning(
-                        "Warning: --snapshot is deprecated. Please use --network-snapshot instead."
-                    )
-                );
+                print_deprecation_warning("--snapshot", "--network-snapshot");
                 args.network_snapshot = Some(snapshot);
             }
         }
         Some(Commands::Profile(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                tracing::warn!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
         }
         Some(Commands::Repl(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                tracing::warn!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
             if let Some(snapshot) = args.snapshot.take() {
-                tracing::warn!(
-                    "{}",
-                    Formatter::warning(
-                        "Warning: --snapshot is deprecated. Please use --network-snapshot instead."
-                    )
-                );
+                print_deprecation_warning("--snapshot", "--network-snapshot");
                 args.network_snapshot = Some(snapshot);
             }
         }
@@ -146,14 +136,31 @@ fn main() -> miette::Result<()> {
     Formatter::configure_colors_from_env();
 
     let mut cli = Cli::parse();
+    if let Some(ref history_file) = cli.history_file {
+        std::env::set_var("SOROBAN_DEBUG_HISTORY_FILE", history_file);
+    }
     if should_show_banner(&cli) {
         print_banner();
     }
     handle_deprecations(&mut cli);
+
+    let run_json_output_requested = matches!(
+        cli.command.as_ref(),
+        Some(Commands::Run(args))
+            if args.output_format == soroban_debugger::cli::args::OutputFormat::Json
+                || args.json
+                || args
+                    .format
+                    .as_deref()
+                    .is_some_and(|f| f.eq_ignore_ascii_case("json"))
+    );
     let verbosity = cli.verbosity();
 
     Formatter::set_verbosity(verbosity_to_level(verbosity));
     initialize_tracing(verbosity);
+
+    // Load community plugins at startup unless disabled via env var.
+    let _ = soroban_debugger::plugin::registry::init_global_plugin_registry();
 
     let config = soroban_debugger::config::Config::load_or_default();
 
@@ -171,9 +178,7 @@ fn main() -> miette::Result<()> {
         Some(Commands::Optimize(args)) => {
             soroban_debugger::cli::commands::optimize(args, verbosity)
         }
-        Some(Commands::UpgradeCheck(args)) => {
-            soroban_debugger::cli::commands::upgrade_check(args, verbosity)
-        }
+        Some(Commands::UpgradeCheck(args)) => soroban_debugger::cli::commands::upgrade_check(args),
         Some(Commands::Compare(args)) => soroban_debugger::cli::commands::compare(args),
         Some(Commands::Replay(args)) => soroban_debugger::cli::commands::replay(args, verbosity),
         Some(Commands::Completions(args)) => {
@@ -194,9 +199,55 @@ fn main() -> miette::Result<()> {
         Some(Commands::Repl(mut args)) => {
             args.merge_config(&config);
             tokio::runtime::Runtime::new()
-                .map_err(|e| miette::miette!(e))?
-                .block_on(soroban_debugger::cli::commands::repl(args))
-                .map_err(|e| miette::miette!(e))
+                .map_err(|e: std::io::Error| miette::miette!(e))
+                .and_then(|rt| rt.block_on(soroban_debugger::cli::commands::repl(args)))
+        }
+        Some(Commands::External(argv)) => {
+            if argv.is_empty() {
+                return Err(miette::miette!("Missing plugin subcommand"));
+            }
+
+            let command = &argv[0];
+            let args = argv[1..].to_vec();
+
+            match soroban_debugger::plugin::registry::execute_global_command(command, &args) {
+                Ok(Some(output)) => {
+                    println!("{}", output);
+                    Ok(())
+                }
+                Ok(None) => {
+                    // If no plugin registered a command, try treating this as a formatter invocation.
+                    if let Ok(Some(formatted)) =
+                        soroban_debugger::plugin::registry::format_global_output(
+                            command,
+                            &args.join(" "),
+                        )
+                    {
+                        println!("{}", formatted);
+                        return Ok(());
+                    }
+
+                    let available = soroban_debugger::plugin::registry::global_commands();
+                    let formatters = soroban_debugger::plugin::registry::global_formatters();
+                    let mut message = format!("Unknown command: '{command}'");
+                    if !available.is_empty() {
+                        message.push_str("\n\nAvailable plugin commands:\n");
+                        for cmd in available {
+                            message.push_str(&format!("  - {}: {}\n", cmd.name, cmd.description));
+                        }
+                    }
+                    if !formatters.is_empty() {
+                        message.push_str("\nAvailable plugin formatters:\n");
+                        for fmt in formatters {
+                            message.push_str(&format!("  - {}\n", fmt.name));
+                        }
+                    }
+                    Err(soroban_debugger::DebuggerError::ExecutionError(message).into())
+                }
+                Err(e) => {
+                    Err(soroban_debugger::DebuggerError::ExecutionError(e.to_string()).into())
+                }
+            }
         }
         None => {
             if let Some(path) = cli.list_functions {
@@ -207,7 +258,7 @@ fn main() -> miette::Result<()> {
                         functions: true,
                         metadata: false,
                         expected_hash: None,
-                        dependency_graph: false,
+                        dependency_graph: None,
                     },
                     verbosity,
                 );
@@ -227,6 +278,17 @@ fn main() -> miette::Result<()> {
     };
 
     if let Err(err) = result {
+        if run_json_output_requested {
+            let output = soroban_debugger::cli::output::CommandOutput::<()> {
+                status: "error".to_string(),
+                result: None,
+                budget: None,
+                errors: Some(vec![err.to_string()]),
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&output) {
+                println!("{}", json);
+            }
+        }
         tracing::error!(
             "{}",
             Formatter::error(format!("Error handling deprecations: {err:#}"))

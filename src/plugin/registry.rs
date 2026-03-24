@@ -1,10 +1,205 @@
-use super::api::{PluginError, PluginResult};
+use super::api::{OutputFormatter, PluginCommand, PluginError, PluginResult};
 use super::events::{EventContext, ExecutionEvent};
 use super::loader::{LoadedPlugin, PluginLoader};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, warn};
+
+static GLOBAL_PLUGIN_REGISTRY: OnceLock<Arc<RwLock<PluginRegistry>>> = OnceLock::new();
+
+fn env_var_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+/// Initialize the global plugin registry and load plugins from disk.
+///
+/// This is intended to be called once at startup.
+pub fn init_global_plugin_registry() -> Arc<RwLock<PluginRegistry>> {
+    GLOBAL_PLUGIN_REGISTRY
+        .get_or_init(|| {
+            let mut registry = PluginRegistry::new().unwrap_or_default();
+            if env_var_truthy("SOROBAN_DEBUG_NO_PLUGINS") {
+                info!("Plugins disabled via SOROBAN_DEBUG_NO_PLUGINS");
+            } else {
+                let _ = registry.load_all_plugins();
+            }
+            Arc::new(RwLock::new(registry))
+        })
+        .clone()
+}
+
+pub fn dispatch_global_event(event: &ExecutionEvent, context: &mut EventContext) {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return;
+    };
+
+    if let Ok(registry) = registry.read() {
+        registry.dispatch_event(event, context);
+    }
+}
+
+pub fn execute_global_command(command: &str, args: &[String]) -> PluginResult<Option<String>> {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return Ok(None);
+    };
+
+    let registry = registry
+        .read()
+        .map_err(|_| PluginError::ExecutionFailed("Failed to acquire registry lock".to_string()))?;
+    registry.execute_command(command, args)
+}
+
+pub fn global_commands() -> Vec<PluginCommand> {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return Vec::new();
+    };
+
+    registry
+        .read()
+        .map(|r| r.all_commands())
+        .unwrap_or_default()
+}
+
+pub fn global_formatters() -> Vec<OutputFormatter> {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return Vec::new();
+    };
+
+    registry
+        .read()
+        .map(|r| r.all_formatters())
+        .unwrap_or_default()
+}
+
+pub fn format_global_output(formatter: &str, data: &str) -> PluginResult<Option<String>> {
+    let Some(registry) = GLOBAL_PLUGIN_REGISTRY.get() else {
+        return Ok(None);
+    };
+
+    let registry = registry
+        .read()
+        .map_err(|_| PluginError::ExecutionFailed("Failed to acquire registry lock".to_string()))?;
+    registry.format_output(formatter, data)
+}
+
+// ---------------------------------------------------------------------------
+// Topological sort — pure helper, no I/O, no plugin loading
+// ---------------------------------------------------------------------------
+
+/// Sort `(name, dependencies)` pairs into a safe registration order using
+/// Kahn's BFS algorithm.
+///
+/// Returns `(ordered_indices, errors)`:
+/// - `ordered_indices` – indices into the original slice, in an order where
+///   every dependency appears before the plugin that declares it.
+/// - `errors` – one `PluginError` for every entry that could not be placed,
+///   either because a declared dependency is absent from the set or because
+///   it participates in a cycle.
+///
+/// This function is intentionally free of `LoadedPlugin` so it can be
+/// exercised in unit tests without touching the file system.
+pub(crate) fn toposort_names(entries: &[(String, Vec<String>)]) -> (Vec<usize>, Vec<PluginError>) {
+    let n = entries.len();
+
+    // Map name → index for O(1) dependency look-up.
+    let name_to_idx: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (name.as_str(), i))
+        .collect();
+
+    // in_degree[i] = number of within-set dependencies still unresolved for entry i.
+    let mut in_degree = vec![0usize; n];
+    // dependents[i] = indices of entries that list entry i as a dependency.
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Accumulate missing-dependency errors per entry (at most one stored).
+    let mut missing: Vec<Option<PluginError>> = (0..n).map(|_| None).collect();
+
+    for (i, (name, deps)) in entries.iter().enumerate() {
+        for dep in deps {
+            match name_to_idx.get(dep.as_str()) {
+                Some(&j) => {
+                    in_degree[i] += 1;
+                    dependents[j].push(i);
+                }
+                None => {
+                    // Dependency is not present in this batch at all.
+                    missing[i] = Some(PluginError::DependencyError(format!(
+                        "Plugin '{}' requires '{}' which is not available in the plugin set",
+                        name, dep
+                    )));
+                }
+            }
+        }
+    }
+
+    // Seed the queue with every entry that has no unresolved in-set deps and
+    // no missing external dep.
+    let mut queue: VecDeque<usize> = (0..n)
+        .filter(|&i| in_degree[i] == 0 && missing[i].is_none())
+        .collect();
+
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+
+    while let Some(i) = queue.pop_front() {
+        order.push(i);
+        for &j in &dependents[i] {
+            if missing[j].is_some() {
+                continue; // already errored; skip to avoid spurious decrement
+            }
+            in_degree[j] -= 1;
+            if in_degree[j] == 0 {
+                queue.push_back(j);
+            }
+        }
+    }
+
+    // Every entry not in `order` either had a missing dep or is in a cycle.
+    let in_order: HashSet<usize> = order.iter().copied().collect();
+    let mut errors: Vec<PluginError> = Vec::new();
+
+    for (i, err) in missing.into_iter().enumerate() {
+        if let Some(e) = err {
+            errors.push(e);
+        } else if !in_order.contains(&i) {
+            errors.push(PluginError::DependencyError(format!(
+                "Plugin '{}' is part of a dependency cycle and cannot be loaded",
+                entries[i].0
+            )));
+        }
+    }
+
+    (order, errors)
+}
+
+/// Consume a `Vec<LoadedPlugin>`, topologically sort it, and return
+/// `(ordered_plugins, sort_errors)`.
+fn toposort_plugins(plugins: Vec<LoadedPlugin>) -> (Vec<LoadedPlugin>, Vec<PluginError>) {
+    // Build the name/deps table that `toposort_names` expects.
+    let entries: Vec<(String, Vec<String>)> = plugins
+        .iter()
+        .map(|p| (p.manifest().name.clone(), p.manifest().dependencies.clone()))
+        .collect();
+
+    let (order, errors) = toposort_names(&entries);
+
+    // Move plugins out of the Vec by index using Option slots.
+    let mut slots: Vec<Option<LoadedPlugin>> = plugins.into_iter().map(Some).collect();
+    let ordered = order
+        .into_iter()
+        .map(|i| slots[i].take().expect("each index appears exactly once"))
+        .collect();
+
+    (ordered, errors)
+}
+
+// ---------------------------------------------------------------------------
+// PluginRegistry
+// ---------------------------------------------------------------------------
 
 /// Registry that manages all loaded plugins
 pub struct PluginRegistry {
@@ -57,30 +252,53 @@ impl PluginRegistry {
         info!("Plugin hot-reload disabled");
     }
 
-    /// Load all plugins from the plugin directory
+    /// Load all plugins from the plugin directory.
+    ///
+    /// Plugins are topologically sorted by their declared dependencies before
+    /// registration, so a valid plugin set loads successfully regardless of
+    /// the order in which the file-system returns the manifest files.
     pub fn load_all_plugins(&mut self) -> Vec<PluginResult<()>> {
         info!("Loading all plugins from plugin directory");
 
-        let results = self.loader.load_all();
-        let mut load_results = Vec::new();
+        // ── Phase 1: load every plugin from disk ──────────────────────────
+        // Separate successful loads from immediate load failures so we can
+        // sort only the plugins we actually have in hand.
+        let mut loaded_plugins: Vec<LoadedPlugin> = Vec::new();
+        let mut load_results: Vec<PluginResult<()>> = Vec::new();
 
-        for result in results {
+        for result in self.loader.load_all() {
             match result {
                 Ok(plugin) => {
-                    let name = plugin.manifest().name.clone();
-                    match self.register_plugin(plugin) {
-                        Ok(_) => {
-                            info!("Successfully registered plugin: {}", name);
-                            load_results.push(Ok(()));
-                        }
-                        Err(e) => {
-                            error!("Failed to register plugin {}: {}", name, e);
-                            load_results.push(Err(e));
-                        }
-                    }
+                    info!("Loaded plugin from disk: {}", plugin.manifest().name);
+                    loaded_plugins.push(plugin);
                 }
                 Err(e) => {
-                    error!("Failed to load plugin: {}", e);
+                    error!("Failed to load plugin from disk: {}", e);
+                    load_results.push(Err(e));
+                }
+            }
+        }
+
+        // ── Phase 2: topological sort ──────────────────────────────────────
+        // This guarantees that every dependency is registered before the
+        // plugin that declares it, regardless of directory enumeration order.
+        let (sorted_plugins, sort_errors) = toposort_plugins(loaded_plugins);
+
+        for e in sort_errors {
+            error!("Dependency sort error: {}", e);
+            load_results.push(Err(e));
+        }
+
+        // ── Phase 3: register in dependency order ──────────────────────────
+        for plugin in sorted_plugins {
+            let name = plugin.manifest().name.clone();
+            match self.register_plugin(plugin) {
+                Ok(_) => {
+                    info!("Successfully registered plugin: {}", name);
+                    load_results.push(Ok(()));
+                }
+                Err(e) => {
+                    error!("Failed to register plugin {}: {}", name, e);
                     load_results.push(Err(e));
                 }
             }
@@ -102,7 +320,9 @@ impl PluginRegistry {
             )));
         }
 
-        // Check dependencies
+        // Check dependencies — after topological sort these should always be
+        // present, but we keep this guard as a safety net for plugins
+        // registered via other code paths (e.g. `reload_plugin`).
         for dep in &plugin.manifest().dependencies {
             if !self.plugins.contains_key(dep) {
                 return Err(PluginError::DependencyError(format!(
@@ -244,11 +464,103 @@ impl PluginRegistry {
         stats.total = self.plugins.len();
         stats
     }
+
+    pub fn all_commands(&self) -> Vec<PluginCommand> {
+        let mut out = Vec::new();
+        for plugin_arc in self.plugins.values() {
+            if let Ok(plugin) = plugin_arc.read() {
+                let caps = &plugin.manifest().capabilities;
+                if !caps.provides_commands {
+                    continue;
+                }
+                out.extend(plugin.plugin().commands());
+            }
+        }
+        out
+    }
+
+    pub fn all_formatters(&self) -> Vec<OutputFormatter> {
+        let mut out = Vec::new();
+        for plugin_arc in self.plugins.values() {
+            if let Ok(plugin) = plugin_arc.read() {
+                let caps = &plugin.manifest().capabilities;
+                if !caps.provides_formatters {
+                    continue;
+                }
+                out.extend(plugin.plugin().formatters());
+            }
+        }
+        out
+    }
+
+    /// Execute a plugin-provided command, if any plugin declares it.
+    pub fn execute_command(&self, command: &str, args: &[String]) -> PluginResult<Option<String>> {
+        for (name, plugin_arc) in &self.plugins {
+            let mut plugin = plugin_arc.write().map_err(|_| {
+                PluginError::ExecutionFailed(format!("Failed to acquire plugin lock: {}", name))
+            })?;
+
+            if !plugin.manifest().capabilities.provides_commands {
+                continue;
+            }
+
+            if !plugin
+                .plugin()
+                .commands()
+                .iter()
+                .any(|cmd| cmd.name == command)
+            {
+                continue;
+            }
+
+            return plugin.plugin_mut().execute_command(command, args).map(Some);
+        }
+
+        Ok(None)
+    }
+
+    pub fn format_output(&self, formatter: &str, data: &str) -> PluginResult<Option<String>> {
+        for (name, plugin_arc) in &self.plugins {
+            let plugin = plugin_arc.read().map_err(|_| {
+                PluginError::ExecutionFailed(format!("Failed to acquire plugin lock: {}", name))
+            })?;
+
+            if !plugin.manifest().capabilities.provides_formatters {
+                continue;
+            }
+
+            if !plugin
+                .plugin()
+                .formatters()
+                .iter()
+                .any(|fmt| fmt.name == formatter)
+            {
+                continue;
+            }
+
+            drop(plugin);
+            let plugin = plugin_arc.write().map_err(|_| {
+                PluginError::ExecutionFailed(format!("Failed to acquire plugin lock: {}", name))
+            })?;
+            return plugin.plugin().format_output(formatter, data).map(Some);
+        }
+
+        Ok(None)
+    }
 }
 
 impl Default for PluginRegistry {
     fn default() -> Self {
-        Self::new().expect("Failed to create default plugin registry")
+        // Use a fallback temporary directory if default creation fails
+        Self::new().unwrap_or_else(|e| {
+            warn!(
+                "Failed to create default plugin registry: {}. Using temporary directory.",
+                e
+            );
+            let temp_dir = std::env::temp_dir().join("soroban-debugger-plugins");
+            Self::with_plugin_dir(temp_dir)
+                .expect("Failed to create plugin registry even with temp directory")
+        })
     }
 }
 
@@ -268,17 +580,157 @@ pub struct PluginStatistics {
     pub supports_hot_reload: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    /// Convenience: build the `(name, deps)` table that `toposort_names` takes.
+    fn entries(pairs: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        pairs
+            .iter()
+            .map(|(n, ds)| (n.to_string(), ds.iter().map(|d| d.to_string()).collect()))
+            .collect()
+    }
+
+    /// Return the plugin names in the order `toposort_names` produces them,
+    /// ignoring the error list (callers assert on it separately when needed).
+    fn sorted_names(pairs: &[(&str, &[&str])]) -> Vec<String> {
+        let e = entries(pairs);
+        let (order, _) = toposort_names(&e);
+        order.into_iter().map(|i| e[i].0.clone()).collect()
+    }
+
+    // ── toposort_names — basic ordering ─────────────────────────────────────
+
+    /// No dependencies: order is stable (matches input order).
+    #[test]
+    fn toposort_no_deps_preserves_input_order() {
+        let names = sorted_names(&[("alpha", &[]), ("beta", &[]), ("gamma", &[])]);
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    /// B depends on A.  When given in natural order (A then B) the result
+    /// must still be [A, B].
+    #[test]
+    fn toposort_dep_natural_order() {
+        let names = sorted_names(&[("a", &[]), ("b", &["a"])]);
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    /// **Core regression** — B depends on A but B is discovered first
+    /// (simulating a filesystem that enumerates "b/" before "a/").
+    /// After the sort, A must appear before B.
+    #[test]
+    fn toposort_dep_reverse_discovery_order() {
+        // B is listed first, as the OS might return it first from read_dir.
+        let names = sorted_names(&[("b", &["a"]), ("a", &[])]);
+        let a_pos = names.iter().position(|n| n == "a").unwrap();
+        let b_pos = names.iter().position(|n| n == "b").unwrap();
+        assert!(
+            a_pos < b_pos,
+            "a must be registered before b; got order: {:?}",
+            names
+        );
+    }
+
+    /// Three-level chain C → B → A in worst-case discovery order (C, B, A).
+    #[test]
+    fn toposort_three_level_chain_worst_discovery_order() {
+        // Worst case: leaf discovered first, root last.
+        let names = sorted_names(&[("c", &["b"]), ("b", &["a"]), ("a", &[])]);
+        let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
+        assert!(pos("a") < pos("b"), "a before b");
+        assert!(pos("b") < pos("c"), "b before c");
+    }
+
+    /// Diamond: both B and C depend on A; D depends on B and C.
+    #[test]
+    fn toposort_diamond_dependency() {
+        // Worst discovery: D, C, B, A
+        let names = sorted_names(&[("d", &["b", "c"]), ("c", &["a"]), ("b", &["a"]), ("a", &[])]);
+        let pos = |n: &str| names.iter().position(|x| x == n).unwrap();
+        assert!(pos("a") < pos("b"), "a before b");
+        assert!(pos("a") < pos("c"), "a before c");
+        assert!(pos("b") < pos("d"), "b before d");
+        assert!(pos("c") < pos("d"), "c before d");
+    }
+
+    // ── toposort_names — error cases ─────────────────────────────────────────
+
+    /// A plugin whose dependency is not in the set at all must produce exactly
+    /// one `DependencyError` and must not appear in the ordered list.
+    #[test]
+    fn toposort_missing_external_dep_produces_error() {
+        let e = entries(&[("b", &["nonexistent"])]);
+        let (order, errors) = toposort_names(&e);
+        assert!(order.is_empty(), "b cannot be ordered without its dep");
+        assert_eq!(errors.len(), 1);
+        assert!(
+            matches!(&errors[0], PluginError::DependencyError(msg) if msg.contains("nonexistent"))
+        );
+    }
+
+    /// A two-plugin cycle (A → B → A) must produce two `DependencyError`s
+    /// (one per plugin) and an empty ordered list.
+    #[test]
+    fn toposort_cycle_produces_errors_for_both_plugins() {
+        let e = entries(&[("a", &["b"]), ("b", &["a"])]);
+        let (order, errors) = toposort_names(&e);
+        assert!(order.is_empty(), "neither plugin can load in a cycle");
+        assert_eq!(errors.len(), 2, "one error per plugin in the cycle");
+        for err in &errors {
+            assert!(
+                matches!(err, PluginError::DependencyError(_)),
+                "expected DependencyError, got {:?}",
+                err
+            );
+        }
+    }
+
+    /// A self-referential plugin (depends on itself) must be detected as a
+    /// cycle and produce a single error.
+    #[test]
+    fn toposort_self_cycle_produces_error() {
+        let e = entries(&[("a", &["a"])]);
+        let (order, errors) = toposort_names(&e);
+        assert!(order.is_empty());
+        assert_eq!(errors.len(), 1);
+    }
+
+    /// Plugins with no deps load fine even when others in the set have cycles.
+    #[test]
+    fn toposort_independent_plugins_unaffected_by_cycle() {
+        let e = entries(&[
+            ("good", &[]),
+            ("cycle-a", &["cycle-b"]),
+            ("cycle-b", &["cycle-a"]),
+        ]);
+        let (order, errors) = toposort_names(&e);
+        assert_eq!(order, vec![0], "only 'good' (index 0) should be ordered");
+        assert_eq!(errors.len(), 2, "cycle-a and cycle-b both error");
+    }
+
+    /// Empty input must not panic and must return empty results.
+    #[test]
+    fn toposort_empty_input() {
+        let (order, errors) = toposort_names(&[]);
+        assert!(order.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    // ── pre-existing registry tests (unchanged) ──────────────────────────────
 
     #[test]
     fn test_registry_creation() {
         let temp_dir = std::env::temp_dir().join("soroban-debug-test-plugins");
         let registry = PluginRegistry::with_plugin_dir(temp_dir.clone());
         assert!(registry.is_ok());
-
-        // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
@@ -286,12 +738,9 @@ mod tests {
     fn test_plugin_statistics() {
         let temp_dir = std::env::temp_dir().join("soroban-debug-test-plugins-stats");
         let registry = PluginRegistry::with_plugin_dir(temp_dir.clone()).unwrap();
-
         let stats = registry.statistics();
         assert_eq!(stats.total, 0);
         assert_eq!(stats.hooks_execution, 0);
-
-        // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

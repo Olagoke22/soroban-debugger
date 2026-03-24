@@ -1,5 +1,45 @@
 use serde::{Deserialize, Serialize};
 
+/// Structured event category used by dynamic security analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DynamicTraceEventKind {
+    #[default]
+    Diagnostic,
+    FunctionCall,
+    StorageRead,
+    StorageWrite,
+    Authorization,
+    CrossContractCall,
+    CrossContractReturn,
+}
+
+/// Rich dynamic trace entry produced by the runtime and consumed by analyzers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DynamicTraceEvent {
+    pub sequence: usize,
+    pub kind: DynamicTraceEventKind,
+    pub message: String,
+    pub function: Option<String>,
+    pub storage_key: Option<String>,
+    pub storage_value: Option<String>,
+    /// Call-frame depth at the time this event was emitted (0 = top-level).
+    /// Used by reentrancy analysis to correlate writes with the frame that
+    /// issued the cross-contract call.
+    #[serde(default)]
+    pub call_depth: u32,
+}
+
+/// Source location information (file, line, column)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceLocation {
+    /// Source file path (relative or absolute)
+    pub file: String,
+    /// 1-based line number
+    pub line: u32,
+    /// 0-based column (optional)
+    pub column: Option<u32>,
+}
+
 /// Wire protocol messages for remote debugging
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -18,6 +58,14 @@ pub enum DebugRequest {
 
     /// Step execution (instruction-level)
     Step,
+    /// Step into next inline/instruction
+    StepIn,
+
+    /// Step over current function
+    Next,
+
+    /// Step out of current function
+    StepOut,
 
     /// Step over to next source line in the same frame
     StepOverLine,
@@ -52,6 +100,12 @@ pub enum DebugRequest {
     /// Load network snapshot
     LoadSnapshot { snapshot_path: String },
 
+    /// Evaluate an expression in the current debug context
+    Evaluate {
+        expression: String,
+        frame_id: Option<u64>,
+    },
+
     /// Ping to check connection
     Ping,
 
@@ -74,6 +128,9 @@ pub enum DebugResponse {
         success: bool,
         output: String,
         error: Option<String>,
+        paused: bool,
+        completed: bool,
+        source_location: Option<SourceLocation>,
     },
 
     /// Step result
@@ -81,6 +138,7 @@ pub enum DebugResponse {
         paused: bool,
         current_function: Option<String>,
         step_count: u64,
+        source_location: Option<SourceLocation>,
     },
 
     /// Source-level step-over result
@@ -96,14 +154,18 @@ pub enum DebugResponse {
         completed: bool,
         output: Option<String>,
         error: Option<String>,
+        paused: bool,
+        source_location: Option<SourceLocation>,
     },
 
     /// Inspection result
     InspectionResult {
         function: Option<String>,
+        args: Option<String>,
         step_count: u64,
         paused: bool,
         call_stack: Vec<String>,
+        source_location: Option<SourceLocation>,
     },
 
     /// Storage state
@@ -133,6 +195,13 @@ pub enum DebugResponse {
     /// Error response
     Error { message: String },
 
+    /// Evaluation result
+    EvaluateResult {
+        result: String,
+        result_type: Option<String>,
+        variables_reference: u64,
+    },
+
     /// Pong response
     Pong,
 
@@ -143,6 +212,7 @@ pub enum DebugResponse {
 /// Message wrapper for the protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugMessage {
+    /// Correlation id used to match a response to the originating request.
     pub id: u64,
     pub request: Option<DebugRequest>,
     pub response: Option<DebugResponse>,
@@ -163,5 +233,9 @@ impl DebugMessage {
             request: None,
             response: Some(response),
         }
+    }
+
+    pub fn is_response_for(&self, expected_id: u64) -> bool {
+        self.id == expected_id && self.response.is_some()
     }
 }

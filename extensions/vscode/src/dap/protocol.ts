@@ -63,4 +63,5 @@ export interface DebuggerState {
   breakpoints: Map<string, BreakpointLocation[]>;
   callStack?: StackFrame[];
   variables?: Variable[];
+  args?: string;
 }

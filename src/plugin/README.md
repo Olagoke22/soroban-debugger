@@ -131,6 +131,23 @@ The plugin system uses dynamic library loading (`libloading` crate) to load plug
 
 The `PluginRegistry` manages all loaded plugins and dispatches events to them.
 
+## Plugin Commands and Formatters
+
+Plugins can provide custom CLI commands via [`InspectorPlugin::commands`]. These are routed at runtime
+using clap's external subcommand support, so a plugin command named `my-command` can be invoked as:
+
+```bash
+soroban-debug my-command arg1 arg2
+```
+
+Plugins can also provide output formatters via [`InspectorPlugin::formatters`]. If no plugin command matches
+an external subcommand, the debugger will attempt to treat it as a formatter name and pass the remaining
+arguments as the input payload:
+
+```bash
+soroban-debug my-formatter '{\"some\":\"json\"}'
+```
+
 ## Security Considerations
 
 ⚠️ **Warning**: Plugins run in the same process as the debugger with full access to your system. Only install plugins from trusted sources.

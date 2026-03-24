@@ -81,7 +81,12 @@ impl PluginLoader {
             .parent()
             .ok_or_else(|| PluginError::Invalid("Invalid manifest path".to_string()))?;
 
-        let library_path = manifest_dir.join(&manifest.library);
+        let mut library_path = manifest_dir.join(&manifest.library);
+        if !library_path.exists() {
+            if let Some(fallback) = resolve_platform_library_path(manifest_dir, &manifest.library) {
+                library_path = fallback;
+            }
+        }
 
         if !library_path.exists() {
             return Err(PluginError::NotFound(format!(
@@ -156,7 +161,13 @@ impl PluginLoader {
         }
     }
 
-    /// Discover all plugins in the plugin directory
+    /// Discover all plugins in the plugin directory.
+    ///
+    /// Results are sorted by path so the discovery order is deterministic
+    /// across platforms and file-system implementations.  The registry's
+    /// topological sort handles dependency ordering; this sort ensures that
+    /// unrelated plugins always appear in the same sequence, making behaviour
+    /// reproducible and tests stable.
     pub fn discover_plugins(&self) -> Vec<PathBuf> {
         let mut manifests = Vec::new();
 
@@ -178,6 +189,10 @@ impl PluginLoader {
             }
         }
 
+        // Sort for deterministic, platform-independent discovery order.
+        // Dependency ordering is handled by the registry's topological sort.
+        manifests.sort();
+
         info!("Discovered {} plugin manifests", manifests.len());
         manifests
     }
@@ -191,6 +206,39 @@ impl PluginLoader {
             .map(|manifest_path| self.load_from_manifest(manifest_path))
             .collect()
     }
+}
+
+fn resolve_platform_library_path(manifest_dir: &Path, library: &str) -> Option<PathBuf> {
+    let wanted_ext = match std::env::consts::OS {
+        "windows" => "dll",
+        "macos" => "dylib",
+        _ => "so",
+    };
+
+    let base = Path::new(library);
+    let stem = base.file_stem()?.to_string_lossy();
+    let file_name = base.file_name()?.to_string_lossy();
+
+    let mut candidates = Vec::new();
+
+    // 1) Same stem, correct extension.
+    candidates.push(format!("{stem}.{wanted_ext}"));
+
+    // 2) Try toggling the `lib` prefix for cross-platform portability.
+    if wanted_ext == "dll" && file_name.starts_with("lib") {
+        candidates.push(format!("{}.dll", stem.trim_start_matches("lib")));
+    } else if wanted_ext != "dll" && !file_name.starts_with("lib") {
+        candidates.push(format!("lib{stem}.{wanted_ext}"));
+    }
+
+    for candidate in candidates {
+        let p = manifest_dir.join(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    None
 }
 
 impl Drop for LoadedPlugin {
@@ -221,5 +269,37 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let loader = PluginLoader::new(temp_dir.clone());
         assert_eq!(loader.plugin_dir, temp_dir);
+    }
+
+    /// `discover_plugins` must return paths in sorted order so that repeated
+    /// calls on the same directory yield the same sequence regardless of the
+    /// order the OS returns directory entries.
+    #[test]
+    fn discover_plugins_returns_sorted_paths() {
+        use std::fs;
+
+        let base = std::env::temp_dir().join("soroban-loader-sort-test");
+        let _ = fs::remove_dir_all(&base);
+
+        // Create three plugin sub-directories in reverse alphabetical order so
+        // a naive read_dir would likely return them unsorted.
+        //............
+        for name in &["plugin-c", "plugin-a", "plugin-b"] {
+            let dir = base.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("plugin.toml"), "").unwrap();
+        }
+
+        let loader = PluginLoader::new(base.clone());
+        let paths = loader.discover_plugins();
+
+        let names: Vec<&str> = paths
+            .iter()
+            .filter_map(|p| p.parent()?.file_name()?.to_str())
+            .collect();
+
+        assert_eq!(names, vec!["plugin-a", "plugin-b", "plugin-c"]);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -21,6 +21,13 @@ pub enum ReplCommand {
 }
 
 impl ReplCommand {
+    /// Built-in REPL commands for completion
+    pub fn builtins() -> &'static [&'static str] {
+        &[
+            "call", "storage", "history", "clear", "help", "exit", "quit",
+        ]
+    }
+
     /// Parse a command string into a ReplCommand
     pub fn parse(input: &str) -> Result<Self> {
         let trimmed = input.trim();
