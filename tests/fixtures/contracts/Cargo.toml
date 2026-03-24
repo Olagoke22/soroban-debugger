@@ -5,6 +5,7 @@ members = [
     "always_panic",
     "budget_heavy",
     "cross_contract",
+    "same_return",
 ]
 resolver = "2"
 
