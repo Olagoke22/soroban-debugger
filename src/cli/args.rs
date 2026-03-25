@@ -538,6 +538,10 @@ pub struct InspectArgs {
     #[arg(long)]
     pub metadata: bool,
 
+    /// Output format: pretty (default) or json
+    #[arg(long, value_enum, default_value = "pretty")]
+    pub format: OutputFormat,
+
     /// Expected SHA-256 hash of the WASM file. If provided, loading will fail if the computed hash does not match.
     #[arg(long)]
     pub expected_hash: Option<String>,
